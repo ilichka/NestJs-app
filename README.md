@@ -574,4 +574,414 @@ export class UsersService {
 }
 ```
 
-Here we added `{include: {allL true}}` to include all fields, that user connected with.
+Here we added `{include: {all: true}}` to include all fields, that user connected with.
+
+## Registration
+
+```bash
+    nest generate module auth
+    nest generate controller auth
+    nest generate service auth
+```
+
+Also install a module to work with jwt token and coding password.
+
+### `npm install @nestjs/jwt bcryptjs`
+
+Cause we use jwt to registration user, we need to register installed module `JWTModule`.
+
+Secret token pass with `secret` field. Expires in `signOptions`
+
+```typescript
+import { Module } from '@nestjs/common';
+import { AuthController } from './auth.controller';
+import { AuthService } from './auth.service';
+import {UsersModule} from "../users/users.module";
+import {JwtModule} from "@nestjs/jwt";
+import * as process from "process";
+
+@Module({
+  controllers: [AuthController],
+  providers: [AuthService],
+  imports: [
+      UsersModule,
+      JwtModule.register({
+        secret: process.env.PRIVATE_KEY || 'SECRET',
+          signOptions: {
+            expiresIn: '24h'
+          }
+      })
+  ]
+})
+export class AuthModule {}
+```
+
+Registration flow: 
+1. Is any user in db with such email?
+2. If yes throw error, else hash password
+3. Create user
+4. generate token
+
+```typescript
+@Injectable()
+export class AuthService {
+    constructor(private userService: UsersService,
+                private jwtService: JwtService) {}
+
+    async registration(userDto: CreateUserDto) {
+        const candidate = await this.userService.getUserByEmail(userDto.email)
+        if(candidate) {
+            throw new HttpException('User with such email already exists', HttpStatus.BAD_REQUEST)
+        }
+        const hashPassword = await bcrypt.hash(userDto.password, 5)
+        const user = await this.userService.createUser({...userDto, password: hashPassword})
+        return this.generateToken(user)
+    }
+
+    async generateToken(user: User) {
+        const payload = {email: user.email, id: user.id, roles: user.roles}
+        return {
+            token: this.jwtService.sign(payload)
+        }
+    }
+}
+```
+
+Login flow: 
+1. Take user from db
+2. compare password
+
+## Guards
+
+We need guard to limit access to endpoints. For example for unauthorized users.
+Create `jwt-auth.guard.ts`. Here we must implement `CanActivate`.
+
+
+```typescript
+import {CanActivate, ExecutionContext, UnauthorizedException} from "@nestjs/common";
+import {Observable} from "rxjs";
+import {JwtService} from "@nestjs/jwt";
+
+@Injectable()
+export class JwtAuthGuard implements CanActivate {
+
+    constructor(private jwtService: JwtService) {}
+
+    canActivate(context: ExecutionContext): boolean | Promise<boolean> | Observable<boolean> {
+        const req = context.switchToHttp().getRequest()
+
+        try {
+            const authHeader = req.headers.authorization
+            const [bearer, token] = authHeader.split(' ')
+
+            if(bearer !== 'Bearer' || !token) {
+                throw new UnauthorizedException({message: 'User not authed'})
+            }
+
+            const user = this.jwtService.verify(token)
+            req.user = user;
+            return true
+        } catch (e) {
+            throw new UnauthorizedException({message: 'User not authed'})
+        }
+    }
+
+}
+```
+
+Let's use our guard on userService. But, during importing modules we get an error 
+about circular dependencies. To prevent this use `forwardRef`.
+
+```typescript
+@Module({
+  controllers: [UsersController],
+  providers: [UsersService],
+  imports: [
+      SequelizeModule.forFeature([User, Role, UserRoles]),
+      RolesModule,
+      forwardRef(()=>AuthModule)
+  ],
+    exports: [UsersService]
+})
+export class UsersModule {}
+```
+
+To use guard use `@UseGuards` decorator.
+
+```typescript
+export class UsersController {
+//...
+
+    @ApiOperation({summary: 'Get users'})
+    @ApiResponse({status: 200, type: [User]})
+    @UseGuards(JwtAuthGuard)
+    @Get()
+    getAll() {
+        return this.usersService.getAllUsers()
+    }
+}
+```
+
+We can block all endpoints as well. In `main.ts` add this row:
+
+```typescript
+  app.useGlobalGuards(JwtAuthGuard)
+```
+
+## Create decorator
+
+```typescript
+import {SetMetadata} from "@nestjs/common";
+
+export const ROLES_KEY = 'roles'
+
+export const Roles = (...roles: string[]) => SetMetadata(ROLES_KEY, roles)
+```
+
+We will use it ro add roles.
+
+Now lets create roles-guard.
+
+
+```typescript
+import {
+    CanActivate,
+    ExecutionContext,
+    HttpException,
+    HttpStatus,
+    Injectable,
+    UnauthorizedException
+} from "@nestjs/common";
+import {Observable} from "rxjs";
+import {JwtService} from "@nestjs/jwt";
+import {Reflector} from "@nestjs/core";
+import {ROLES_KEY} from "./roles-auth.decorator";
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+
+    constructor(private jwtService: JwtService,
+                private reflector: Reflector) {}
+
+    canActivate(context: ExecutionContext): boolean | Promise<boolean> | Observable<boolean> {
+        const req = context.switchToHttp().getRequest()
+
+        try {
+            const requiredRoles = this.reflector.getAllAndOverride<string[]>(ROLES_KEY, [
+                context.getHandler(),
+                context.getClass()
+            ])
+            if(!requiredRoles) {
+                return true
+            }
+            const authHeader = req.headers.authorization
+            const [bearer, token] = authHeader.split(' ')
+
+            if(bearer !== 'Bearer' || !token) {
+                throw new UnauthorizedException({message: 'User not authed'})
+            }
+
+            const user = this.jwtService.verify(token)
+            req.user = user;
+            return user.roles.some(role => requiredRoles.includes(role.value))
+        } catch (e) {
+            throw new HttpException('User has no access', HttpStatus.FORBIDDEN)
+        }
+    }
+
+}
+```
+
+## Role assignments and bans
+
+Create 2 endpoints and 2 functions in `user.service.ts`: 
+
+```typescript
+import {HttpException, HttpStatus, Injectable} from '@nestjs/common';
+import {User} from "./users.model";
+import {InjectModel} from "@nestjs/sequelize";
+import {CreateUserDto} from "./dto/create-user-dto";
+import {RolesService} from "../roles/roles.service";
+import {AddRoleDto} from "./dto/add-role.dto";
+import {BanUserDto} from "./dto/ban-user.dto";
+
+@Injectable()
+export class UsersService {
+//...
+    
+    async addRole(dto: AddRoleDto) {
+        const user = await this.userRepository.findByPk(dto.userId)
+        const role = await this.roleService.getRoleByValue(dto.value)
+
+        if(role && user) {
+            await user.$add('role', role.id)
+            return dto
+        }
+
+        throw new HttpException('Users or role not found', HttpStatus.NOT_FOUND)
+    }
+
+    async ban(dto: BanUserDto) {
+        const user = await this.userRepository.findByPk(dto.userId);
+        if (!user) {
+            throw new HttpException('Пользователь не найден', HttpStatus.NOT_FOUND);
+        }
+        user.banned = true;
+        user.banReason = dto.banReason;
+        await user.save();
+        return user;
+    }
+}
+
+```
+
+In `addRole` we find user by PK and role by value. If both exist, with method `$add` mutate 
+our roles.
+
+In `ban` we find user again. Then reassign field ban and banReason. Call `save` method
+to save changes in db
+
+## NestJs pipes
+
+Pipes have 2 main purposes:
+- transform incoming data 
+- validate incoming data
+
+Lets create validation pipe. Here we need to install 2 tools:
+
+### `npm install class-validator class-transformer`
+
+Firstly validate create user dto. 
+
+```typescript
+import {ApiProperty} from "@nestjs/swagger";
+import {IsEmail, IsString, Length} from "class-validator";
+
+export class CreateUserDto {
+    @ApiProperty({example: 'user@gmail.com', description: 'User email'})
+    @IsString({message: 'Must be a string'})
+    @IsEmail({},{message: 'Wrong email signature'})
+    readonly email: string;
+    @ApiProperty({example: '12345', description: 'User password'})
+    @IsString({message: 'Must be a string'})
+    @Length(4, 16, {message: 'Password must have length at least 4 and not more than 16'})
+    readonly password: string;
+}
+```
+
+We created basic validation, and now we will create some transforms in our pipe.
+
+```typescript
+
+```
+
+1. Receive an object, that we would validate. Call `plainToClass` to transform our value
+to class.
+2. Then with `validate` method we receive an error, that will return to us after validation
+of our object.
+
+To use pipe use decorator `@UsePipe`: 
+
+```typescript
+    @ApiOperation({summary: 'Create user'})
+    @ApiResponse({status: 200, type: User})
+    @UsePipes(ValidationPipe)
+    @Post()
+    create(@Body() userDto: CreateUserDto) {
+        return this.usersService.createUser(userDto)
+    }
+```
+
+To add global pipes call in `main.ts` app method. They will trigger to each endpoint:
+
+```typescript
+  app.useGlobalPipes()
+```
+
+## Create posts and work with static
+
+```bash
+    nest generate module posts
+    nest generate controller posts
+    nest generate service posts
+```
+
+Crete `post.model.ts`. Also add relations. Cause 1 user can have a lot of posts - relations
+will be 1 to many. To create this relation use decorator `@BelongsTo` and add foreign key.
+We need to update `users.model.ts` as well. Add `@HasMany` decorator here. 
+
+Move to controller and create endpoint.
+
+```typescript
+import {Body, Controller, Post, UploadedFile, UseInterceptors} from '@nestjs/common';
+import {PostsService} from "./posts.service";
+import {FileInterceptor} from "@nestjs/platform-express";
+import {CreatePostDto} from "./dto/create-post.dto";
+
+@Controller('posts')
+export class PostsController {
+
+    constructor(private postService: PostsService) {}
+
+    @Post()
+    @UseInterceptors(FileInterceptor('image'))
+    createPost(@Body() dto: CreatePostDto,
+               @UploadedFile() image) {
+        return this.postService.create(dto, image)
+    }
+}
+
+```
+
+To get file in controller use decorator `@UploadedFile`. To work with file we need to add
+additional decorator `@UseInterceptors` and as a parameter pass `FileInterceptor`
+
+To work with files we have to create another service:
+
+```bash
+    nest generate module files
+    nest generate service files
+```
+
+Move to file service and create function `createFile`. Import module to work with files `fs`.
+Import module to work with path `path`. And to generate random file names install:
+
+### `npm install uuid`
+
+- Generate unique name for our file, use `uuid.v4()`.
+- Use `path.resolve` to create path to file. 
+- Then we check if there is nothing by this pass, so we need to create folder `mkdirSync`.
+- Now folder exists and we can write file there `writeFileSync`
+
+```typescript
+import {HttpException, HttpStatus, Injectable} from '@nestjs/common';
+import * as path from 'path'
+import * as fs from 'fs';
+import * as uuid from 'uuid';
+
+@Injectable()
+export class FilesService {
+
+    async createFile(file): Promise<string> {
+        try {
+            const fileName = uuid.v4() + '.jpg';
+            const filePath = path.resolve(__dirname, '..', 'static')
+            if (!fs.existsSync(filePath)) {
+                fs.mkdirSync(filePath, {recursive: true})
+            }
+            fs.writeFileSync(path.join(filePath, fileName), file.buffer)
+            return fileName;
+        } catch (e) {
+            throw new HttpException('Error while loading file', HttpStatus.INTERNAL_SERVER_ERROR)
+        }
+    }
+
+}
+```
+
+To make our server give us static install this dependency:
+
+### `npm install --save @nestjs/serve-static`
+
+After this in `app.module` register `ServeStaticModule`. Now your images available 
+by path `localhost:5000/{file-name}`.
